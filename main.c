@@ -19,6 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include <stdio.h>
+#include <string.h>
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
@@ -48,6 +49,12 @@ UART_HandleTypeDef huart2;
 volatile uint8_t btn_event = 0;
 uint32_t last_unix = 0;
 uint32_t idle_deadline_ms = 0;
+
+#define BLE_BAUD_DEFAULT 9600
+uint32_t ble_adv_deadline = 0;
+uint8_t ble_connected = 0;
+
+char ble_rxline[128];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -59,7 +66,45 @@ static void MX_RTC_Init(void);
 void app_on_button(void);
 void led_blink_ok(void);
 void enter_stop_and_relock(void);
-uint32_t ret_unix_now(void);
+uint32_t rtc_unix_now(void);
+
+HAL_StatusTypeDef ble_send(const char* s) {
+	return HAL_UART_Transmit(&huart2, (uint8_t*)s, (uint16_t)strlen(s), 200);
+
+}
+
+int ble_getline(char* out, int max, uint32_t to_ms) {
+
+	uint32_t t0 = HAL_GetTick(); int i =0; uint8_t c;
+
+	while (HAL_GetTick() - t0 < to_ms && i < max-1) {
+		if (HAL_UART_Receive(&huart2, &c, 1, 5) == HAL_OK) {
+			out[i++] = (char)c;
+			if (c == '\n') break;
+		}
+	}
+	out[i] = 0;
+	return i;
+}
+
+void ble_init_and_name(void) {
+	char line[64];
+
+	ble_send("AT+ROLE0\r\n");
+	ble_getline(line, sizeof line, 200);
+
+	ble_send("AT+NAMEPillboxA\r\n");
+	ble_getline(line, sizeof line, 200);
+
+	ble_send("AT+IMME1\r\n");
+	ble_getline(line, sizeof line, 200);
+
+	ble_send("AT+NAMEPillboxA\r\n");
+	ble_getline(line, sizeof line, 200);
+}
+
+void ble_start_advertising(uint32_t ms);
+void ble_stop_advertising(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -75,8 +120,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-	char msg[] = "Hello from STM32!\r\n";
-	HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+
 
   /* USER CODE END 1 */
 
@@ -102,6 +146,7 @@ int main(void)
   MX_RTC_Init();
   /* USER CODE BEGIN 2 */
   led_blink_ok();
+  ble_init_and_name();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -111,10 +156,16 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+	  ble_pump_and_process();
+
 	  if (btn_event) {
 		  btn_event = 0;
 		  app_on_button();
 		  idle_deadline_ms = HAL_GetTick() + 3000;
+	  }
+
+	  if (ble_adv_deadline && (int32_t)(HAL_GetTick() - ble_adv_deadline) >= 0) {
+		  if (!ble_connected) ble_stop_advertising();
 	  }
 
 	  if (idle_deadline_ms && (int32_t)(HAL_GetTick() - idle_deadline_ms) >= 0) {
@@ -272,7 +323,8 @@ static void MX_USART2_UART_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN USART2_Init 2 */
-
+  char msg[] = "Hello from STM32!\r\n";
+  HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
   /* USER CODE END USART2_Init 2 */
 
 }
@@ -329,9 +381,12 @@ uint32_t rtc_unix_now(void)
 
 	return (uint32_t)(t.Hours*3600u + t.Minutes*60u + t.Seconds);
 }
-void HAL_GPIO_EXT1_Callback(uint16_t pin)
+
+void HAL_GPIO_EXTI_Callback(uint16_t pin)
 {
-	if (pin == B1_Pin) {
+
+	if (pin == B1_Pin){
+		HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
 		btn_event = 1;
 	}
 }
@@ -352,6 +407,8 @@ void app_on_button(void)
 	char buf[64];
 	int n = snprintf(buf, sizeof(buf), "Event at %lu sec\r\n", last_unix);
 	HAL_UART_Transmit(&huart2, (uint8_t*)buf, n, HAL_MAX_DELAY);
+
+	ble_start_advertising(30000);
 }
 
 void enter_stop_and_relock(void)
@@ -362,6 +419,61 @@ void enter_stop_and_relock(void)
 
 	SystemClock_Config();
 	HAL_ResumeTick();
+}
+
+void ble_start_advertising(uint32_t ms)
+{
+	char line[64];
+	ble_send("AT+RESET\r\n");
+	ble_getline(line, sizeof line, 200);
+
+	ble_send("AT+ADVEN1\r\n");
+	ble_getline(line, sizeof line, 200);
+
+	ble_adv_deadline = HAL_GetTick() + ms;
+}
+
+void ble_stop_advertising(void)
+{
+	char line[64];
+	ble_send("AT+ADVEN0\r\n");
+	ble_getline(line, sizeof line, 200);
+	ble_adv_deadline = 0;
+}
+
+void ble_pump_and_process(void)
+{
+	int n = ble_getline(ble_rxline, sizeof ble_rxline, 5);
+	if (n <= 0) return;
+
+	if (strstr(ble_rxline, "CONNECTED")) { ble_connected = 1; return; }
+	if (strstr(ble_rxline, "LOST"))		 { ble_connected = 0; return; }
+
+}
+
+void on_ble_line(const char* s) {
+	if (0 == strncmp(s, "PING", 4)) {
+		ble_send("PONG\r\n");
+		return;
+	}
+
+	if (0 == strncmp(s, "SYNC:FROM:", 10)) {
+		uint32_t from = strtoul(s+10, NULL, 10);
+
+		char buf[96];
+
+		int n = snprintf(buf, sizeof buf, "INFO:COUNT:1\r\nTS:%lu,F:%u,B:%u\r\nDONE\r\n",
+		                         last_unix, 1u, 3300u);
+		        HAL_UART_Transmit(&huart2, (uint8_t*)buf, n, 200);
+		        return;
+		    }
+
+	if (0 == strncmp(s, "SLEEP", 5)) {
+	        ble_send("OK\r\n");
+	        ble_stop_advertising();
+	        idle_deadline_ms = HAL_GetTick() + 500; // go back to STOP soon
+	        return;
+	    }
 }
 /* USER CODE END 4 */
 
